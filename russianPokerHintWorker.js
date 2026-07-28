@@ -956,13 +956,19 @@ function settleRussianPokerHand(playerCards, dealerCards, ante, bet, alreadyPaid
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.RUSSIAN_POKER_HINT_RULES_VERSION = void 0;
+exports.getRussianPokerContinuationSampleBudgets = getRussianPokerContinuationSampleBudgets;
 exports.getRussianPokerHintCacheKey = getRussianPokerHintCacheKey;
 exports.getRussianPokerDeterministicSample = getRussianPokerDeterministicSample;
 exports.getRussianPokerRevealedDealerPurchaseEv = getRussianPokerRevealedDealerPurchaseEv;
 exports.getRussianPokerFinalHint = getRussianPokerFinalHint;
 exports.getRussianPokerInsuranceHint = getRussianPokerInsuranceHint;
 exports.getRussianPokerDealerGameHint = getRussianPokerDealerGameHint;
+exports.getRussianPokerManualPolicyNamespace = getRussianPokerManualPolicyNamespace;
+exports.russianPokerManualCandidateKey = russianPokerManualCandidateKey;
+exports.canonicalRussianPokerManualPair = canonicalRussianPokerManualPair;
 exports.getRussianPokerInitialHint = getRussianPokerInitialHint;
+exports.getRussianPokerManualPhysicalScenario = getRussianPokerManualPhysicalScenario;
+exports.getRussianPokerManualComparisonBatch = getRussianPokerManualComparisonBatch;
 exports.clearRussianPokerHintCache = clearRussianPokerHintCache;
 const cardService_1 = require("./cardService");
 const handEvaluator_1 = require("./handEvaluator");
@@ -978,6 +984,11 @@ const EXACT_OUTER_CONTINUATION_SAMPLES = 96;
 const COARSE_PURCHASE_SAMPLES = 4;
 const PRECISE_PURCHASE_SAMPLES = 8;
 const resultCache = new Map();
+function getRussianPokerContinuationSampleBudgets(precision, heldOutOverride) {
+    return { policyDecisionSamples: precision === 'precise' ? PRECISE_CONTINUATION_SAMPLES : COARSE_CONTINUATION_SAMPLES,
+        heldOutEvaluationSamples: heldOutOverride ?? (precision === 'precise' ? PRECISE_CONTINUATION_SAMPLES : COARSE_CONTINUATION_SAMPLES),
+        purchaseDecisionSamples: precision === 'precise' ? PRECISE_PURCHASE_SAMPLES : COARSE_PURCHASE_SAMPLES };
+}
 const sortedIds = (cards = []) => cards.map((card) => card.id).sort();
 const ratio = (amount, ante) => Number((amount / ante).toFixed(8));
 function getRussianPokerHintCacheKey(phase, state) {
@@ -1212,11 +1223,7 @@ function purchaseDecisionAndEvaluation(player, dealer, remaining, ante, cost, ke
     }
     return total / samples;
 }
-/** Independent visible-state continuation replica; decision and evaluation streams are disjoint. */
-function visibleContinuation(state, precision, replicaKey, sampleOverride) {
-    const continuationSamples = sampleOverride ?? (precision === 'precise' ? PRECISE_CONTINUATION_SAMPLES : COARSE_CONTINUATION_SAMPLES);
-    const purchaseSamples = precision === 'precise' ? PRECISE_PURCHASE_SAMPLES : COARSE_PURCHASE_SAMPLES;
-    const key = `${samplingKey('final_play_fold', state)}|continuation|${precision}|replica:${replicaKey}`;
+function selectContinuationPolicy(state, key, continuationSamples, purchaseSamples) {
     const known = [...state.playerCards, state.dealerVisibleCard, ...(state.discardedPlayerCards ?? [])];
     const deck = unknownDeck(known);
     const player = preparedPlayer(state.playerCards);
@@ -1224,7 +1231,7 @@ function visibleContinuation(state, precision, replicaKey, sampleOverride) {
     const fold = -(state.ante + cost) / state.ante;
     const postBet = state.availableBalance - state.ante * 2;
     if (postBet < 0)
-        return { ev: fold, varianceOfMean: 0 };
+        return { plays: false, insurance: 0, fold };
     const insuranceMax = (0, russianPoker_1.canInsureRussianPokerHand)(state.playerCards) ? (0, russianPoker_1.getRussianPokerSelectableInsuranceMaximum)((0, russianPoker_1.getRussianPokerInsuranceLimit)(state.playerCards, state.ante * 2, state.playerCards.length === 6).maximumInsurance, postBet, state.ante) : 0;
     const decisionScenarios = [];
     let decisionNoGame = 0;
@@ -1248,25 +1255,64 @@ function visibleContinuation(state, precision, replicaKey, sampleOverride) {
         value += insurance > 0 ? (!dealerQualifiesScore(scenario.score) ? insurance / state.ante : player.score > scenario.score ? -insurance / state.ante : 0) : 0;
         decisionPlayTotal += value;
     });
-    const decisionPlays = decisionPlayTotal / continuationSamples > fold;
-    if (!decisionPlays)
-        return { ev: fold, varianceOfMean: 0 };
+    return { plays: decisionPlayTotal / continuationSamples > fold, insurance, fold };
+}
+/** Independent visible-state continuation replica; decision and evaluation streams are disjoint. */
+function visibleContinuation(state, precision, replicaKey, sampleOverride, commonScenarioKey) {
+    const budgets = getRussianPokerContinuationSampleBudgets(precision, sampleOverride);
+    const key = commonScenarioKey ?? `${samplingKey('final_play_fold', state)}|continuation|${precision}|replica:${replicaKey}`;
+    const known = [...state.playerCards, state.dealerVisibleCard, ...(state.discardedPlayerCards ?? [])];
+    const deck = unknownDeck(known);
+    const player = preparedPlayer(state.playerCards);
+    const cost = state.improvementCost ?? 0;
+    const postBet = state.availableBalance - state.ante * 2;
+    const policy = selectContinuationPolicy(state, key, budgets.policyDecisionSamples, budgets.purchaseDecisionSamples);
+    if (!policy.plays)
+        return { ev: policy.fold, varianceOfMean: 0 };
     let total = 0;
     let squares = 0;
-    for (let sample = 0; sample < continuationSamples; sample += 1) {
+    for (let sample = 0; sample < budgets.heldOutEvaluationSamples; sample += 1) {
         const draw = sampledPrefix(deck, hash(`${key}|evaluation-hidden|${sample}`), 4);
         const dealer = [state.dealerVisibleCard, ...draw.slice(0, 4)];
         const score = (0, handEvaluator_1.evaluateCardScore)(dealer);
         let value = scenarioNet(player, score, state.ante, cost);
-        if (!dealerQualifiesScore(score) && (0, russianPoker_1.russianPokerDealerQualifies)(player.hand) && postBet + insurance >= state.ante)
-            value = purchaseDecisionAndEvaluation(player, dealer, draw.slice(4), state.ante, cost, `${key}|dealer|${sample}`, purchaseSamples);
-        value += insurance > 0 ? (!dealerQualifiesScore(score) ? insurance / state.ante : player.score > score ? -insurance / state.ante : 0) : 0;
+        if (!dealerQualifiesScore(score) && (0, russianPoker_1.russianPokerDealerQualifies)(player.hand) && postBet + policy.insurance >= state.ante)
+            value = purchaseDecisionAndEvaluation(player, dealer, draw.slice(4), state.ante, cost, `${key}|dealer|${sample}`, budgets.purchaseDecisionSamples);
+        value += policy.insurance > 0 ? (!dealerQualifiesScore(score) ? policy.insurance / state.ante : player.score > score ? -policy.insurance / state.ante : 0) : 0;
         total += value;
         squares += value * value;
     }
-    const ev = total / continuationSamples;
-    const sampleVariance = continuationSamples > 1 ? Math.max(0, (squares - total * total / continuationSamples) / (continuationSamples - 1)) : 0;
-    return { ev, varianceOfMean: sampleVariance / continuationSamples };
+    const ev = total / budgets.heldOutEvaluationSamples;
+    const sampleVariance = budgets.heldOutEvaluationSamples > 1 ? Math.max(0, (squares - total * total / budgets.heldOutEvaluationSamples) / (budgets.heldOutEvaluationSamples - 1)) : 0;
+    return { ev, varianceOfMean: sampleVariance / budgets.heldOutEvaluationSamples };
+}
+function getRussianPokerManualPolicyNamespace(dealKey, selectedKeys, replica) {
+    const pairKey = canonicalRussianPokerManualPair(selectedKeys).join('|');
+    return `manual-policy-v2|deal:${dealKey}|pair:${pairKey}|replica:${replica}`;
+}
+function russianPokerManualCandidateKey(candidate) {
+    if (candidate.action === 'fold' || candidate.action === 'play')
+        return candidate.action;
+    if (candidate.action === 'buy_sixth_card')
+        return 'buy-sixth';
+    if (candidate.action !== 'exchange' || !candidate.exchangeCardIds?.length)
+        throw new Error('Unsupported manual-comparison candidate');
+    return `exchange:${[...candidate.exchangeCardIds].sort().join(',')}`;
+}
+function canonicalRussianPokerManualPair(keys) {
+    if (keys.length !== 2 || keys[0] === keys[1])
+        throw new Error('Select exactly two distinct candidates');
+    return [...keys].sort();
+}
+function manualCandidate(key) {
+    if (key === 'fold' || key === 'play')
+        return { action: key };
+    if (key === 'buy-sixth')
+        return { action: 'buy_sixth_card' };
+    const ids = key.slice('exchange:'.length).split(',').filter(Boolean).sort();
+    if (!ids.length)
+        throw new Error('Empty exchange candidate');
+    return { action: 'exchange', exchangeCardIds: ids };
 }
 function initialCandidates(state) {
     const result = [{ action: 'fold' }];
@@ -1384,9 +1430,103 @@ function getRussianPokerInitialHint(state) {
     resultCache.set(key, result);
     return result;
 }
+function getRussianPokerManualPhysicalScenario(state, dealKey, selectedKeys, absoluteReplica) {
+    if (!dealKey || !Number.isSafeInteger(absoluteReplica) || absoluteReplica < 0)
+        throw new Error('Invalid manual physical scenario identity');
+    const [leftKey, rightKey] = canonicalRussianPokerManualPair(selectedKeys);
+    const pairKey = `${leftKey}|${rightKey}`;
+    const deck = unknownDeck([...state.playerCards, state.dealerVisibleCard, ...(state.discardedPlayerCards ?? [])]);
+    const permutation = sampledPrefix(deck, hash(`${samplingKey('initial', state)}|manual-deep-v2|deal:${dealKey}|pair:${pairKey}|replica:${absoluteReplica}`), deck.length);
+    return { absoluteReplica, dealerHiddenCardIds: Object.freeze(permutation.slice(0, 4).map(card => card.id)),
+        permutationCardIds: Object.freeze(permutation.map(card => card.id)) };
+}
+function getRussianPokerManualComparisonBatch(state, dealKey, selectedKeys, batchIndex, sampleCount = 1536, absoluteStart = batchIndex * 1536) {
+    if (!dealKey)
+        throw new Error('Manual comparison requires a deal key');
+    if (!Number.isSafeInteger(batchIndex) || batchIndex < 0 || batchIndex >= 5)
+        throw new Error('Manual comparison supports five batches');
+    if (!Number.isSafeInteger(sampleCount) || sampleCount < 1)
+        throw new Error('Invalid manual comparison sample count');
+    if (!Number.isSafeInteger(absoluteStart) || absoluteStart < 0)
+        throw new Error('Invalid manual comparison range');
+    const [leftKey, rightKey] = canonicalRussianPokerManualPair(selectedKeys);
+    const pairKey = `${leftKey}|${rightKey}`;
+    const legal = new Set(initialCandidates(state).map(candidate => russianPokerManualCandidateKey(candidate)));
+    if (!legal.has(leftKey) || !legal.has(rightKey))
+        throw new Error('Illegal manual-comparison candidate');
+    const initialDeck = unknownDeck([...state.playerCards, state.dealerVisibleCard, ...(state.discardedPlayerCards ?? [])]);
+    const cardById = new Map(initialDeck.map(card => [card.id, card]));
+    const directPlayInsurance = leftKey === 'play' || rightKey === 'play' ? getRussianPokerInsuranceHint({ ...state,
+        availableBalance: state.availableBalance - state.ante * 2, improvementUsed: true }).recommendedInsuranceAmount ?? 0 : null;
+    const evaluate = (key, permutation, replica) => {
+        if (key === 'fold')
+            return -1;
+        const candidate = manualCandidate(key);
+        let cards = state.playerCards;
+        let cost = 0;
+        let replacementCount = 0;
+        if (candidate.action === 'buy_sixth_card') {
+            replacementCount = 1;
+            cost = state.ante;
+            cards = [...cards, permutation[4]];
+        }
+        else if (candidate.action === 'exchange') {
+            const exchanged = new Set(candidate.exchangeCardIds);
+            replacementCount = exchanged.size;
+            cost = state.ante;
+            cards = [...cards.filter(card => !exchanged.has(card.id)), ...permutation.slice(4, 4 + replacementCount)];
+        }
+        const discarded = [...(state.discardedPlayerCards ?? []), ...state.playerCards.filter(card => candidate.exchangeCardIds?.includes(card.id))];
+        const continuationState = { ...state, playerCards: cards, discardedPlayerCards: discarded,
+            availableBalance: state.availableBalance - cost, improvementUsed: true,
+            improvementType: candidate.action === 'exchange' ? 'exchange' : candidate.action === 'buy_sixth_card' ? 'sixth_card' : undefined, improvementCost: cost };
+        const policyKey = `${samplingKey('final_play_fold', continuationState)}|${getRussianPokerManualPolicyNamespace(dealKey, [leftKey, rightKey], replica)}`;
+        const sampledPolicy = key === 'play' ? null : selectContinuationPolicy(continuationState, policyKey, PRECISE_CONTINUATION_SAMPLES, PRECISE_PURCHASE_SAMPLES);
+        const policy = sampledPolicy ?? { plays: true, insurance: directPlayInsurance ?? 0, fold: -1 };
+        if (!policy.plays)
+            return policy.fold;
+        const dealer = [state.dealerVisibleCard, ...permutation.slice(0, 4)];
+        const dealerScore = (0, handEvaluator_1.evaluateCardScore)(dealer);
+        const player = preparedPlayer(cards);
+        let value = scenarioNet(player, dealerScore, state.ante, cost);
+        const postBet = continuationState.availableBalance - state.ante * 2;
+        if (!dealerQualifiesScore(dealerScore) && (0, russianPoker_1.russianPokerDealerQualifies)(player.hand) && postBet + policy.insurance >= state.ante) {
+            const unavailable = new Set([...cards, ...dealer, ...discarded].map(card => card.id));
+            const decisionDeck = (0, cardService_1.createDeck)().filter(card => !unavailable.has(card.id));
+            const take = value;
+            const buys = sampledPurchaseEv(player, dealer, decisionDeck, state.ante, cost, `${policyKey}|revealed:${dealer.slice(1).map(card => card.id).sort().join(',')}`, PRECISE_PURCHASE_SAMPLES) > take;
+            if (buys) {
+                const physicalRemaining = permutation.slice(4 + replacementCount).filter(card => !unavailable.has(card.id));
+                const replacement = (0, russianPoker_1.buyRussianPokerDealerGame)(dealer, physicalRemaining.slice(0, 2));
+                value = scenarioNet(player, (0, handEvaluator_1.evaluateCardScore)(replacement.dealerCards), state.ante, cost + state.ante, true);
+            }
+        }
+        value += policy.insurance > 0 ? (!dealerQualifiesScore(dealerScore) ? policy.insurance / state.ante : player.score > dealerScore ? -policy.insurance / state.ante : 0) : 0;
+        return value;
+    };
+    let leftSum = 0;
+    let rightSum = 0;
+    let differenceSum = 0;
+    let differenceSquares = 0;
+    for (let offset = 0; offset < sampleCount; offset += 1) {
+        // The preliminary 768-replica stream has no `manual-deep-v2` namespace. Each
+        // canonical pair gets five disjoint absolute ranges in this independent stream.
+        const absoluteReplica = absoluteStart + offset;
+        const physical = getRussianPokerManualPhysicalScenario(state, dealKey, [leftKey, rightKey], absoluteReplica);
+        const permutation = physical.permutationCardIds.map(id => cardById.get(id));
+        const left = evaluate(leftKey, permutation, absoluteReplica);
+        const right = evaluate(rightKey, permutation, absoluteReplica);
+        const difference = left - right;
+        leftSum += left;
+        rightSum += right;
+        differenceSum += difference;
+        differenceSquares += difference * difference;
+    }
+    return { dealKey, pairKey, batchIndex, sampleCount, leftKey, rightKey, leftSum, rightSum, differenceSum, differenceSquares };
+}
 function clearRussianPokerHintCache() { resultCache.clear(); }
 
 }},cache={};
 function require(id){const key=id.replace(/\.js$/,'');if(cache[key])return cache[key].exports;const factory=modules[key];if(!factory)throw new Error('Unknown worker module '+key);const module={exports:{}};cache[key]=module;factory(require,module,module.exports);return module.exports;}
 const engine=require('./russianPokerHint');
-self.onmessage=({data})=>{const {id,request}=data;try{let result;switch(request.phase){case 'initial':result=engine.getRussianPokerInitialHint(request.state);break;case 'final_play_fold':result=engine.getRussianPokerFinalHint(request.state);break;case 'insurance':result=engine.getRussianPokerInsuranceHint(request.state);break;case 'dealer_game':result=engine.getRussianPokerDealerGameHint(request.state);break;default:throw new Error('Unsupported phase');}self.postMessage({id,result});}catch(error){self.postMessage({id,error:error instanceof Error?error.message:String(error)});}};
+self.onmessage=({data})=>{const {id,request}=data;try{let result;switch(request.phase){case 'initial':result=engine.getRussianPokerInitialHint(request.state);break;case 'final_play_fold':result=engine.getRussianPokerFinalHint(request.state);break;case 'insurance':result=engine.getRussianPokerInsuranceHint(request.state);break;case 'dealer_game':result=engine.getRussianPokerDealerGameHint(request.state);break;case 'manual_comparison':result=engine.getRussianPokerManualComparisonBatch(request.state,request.dealKey,request.candidateKeys,request.batchIndex,request.sampleCount);break;default:throw new Error('Unsupported phase');}self.postMessage({id,result});}catch(error){self.postMessage({id,error:error instanceof Error?error.message:String(error)});}};
