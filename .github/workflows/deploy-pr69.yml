@@ -1,0 +1,58 @@
+name: Temporary PR 69 web deployment
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deploy-pr69-web
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'codex/deploy-pr69-web'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact production branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Verify base and download validated export
+        env:
+          ARTIFACT_URL: 'https://sdmntprwestus3.oaiusercontent.com/files/00000000-ebec-81fd-aa1e-65f3b0c91c82/raw?se=2026-08-01T16:09:05Z&sp=r&sv=2026-02-06&sr=b&scid=a6763612-4224-485d-9700-ceb18f04e708&skoid=1a0ef048-201c-43e0-8950-52d58956a71a&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-08-01T01:18:58Z&ske=2026-08-02T01:18:58Z&sks=b&skv=2026-02-06&sig=sNDYu6rrvuaaXmCEVXXkuesLELT2xgILtBCxyE6h9k0%3D'
+          EXPECTED_SHA256: 'c50abe86a55ce14b01b8b97475ff90a946bd2a54925775bbc8c1b3c408970034'
+          EXPECTED_BASE_SHA: '37c350a589e86d4480b8f9ff93efd1bb1324fc92'
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_BASE_SHA"
+          curl --fail --location --retry 3 "$ARTIFACT_URL" --output "$RUNNER_TEMP/web-dist-pr69.zip"
+          echo "$EXPECTED_SHA256  $RUNNER_TEMP/web-dist-pr69.zip" | sha256sum --check -
+          mkdir -p "$RUNNER_TEMP/export"
+          unzip -q "$RUNNER_TEMP/web-dist-pr69.zip" -d "$RUNNER_TEMP/export"
+          test -f "$RUNNER_TEMP/export/index.html"
+          test -f "$RUNNER_TEMP/export/_expo/static/js/web/entry-bcce47eeae7e7708630a40586f95c37e.js"
+
+      - name: Replace generated site and validate scope
+        run: |
+          rsync --archive --delete --exclude='.git/' --exclude='.github/' --exclude='.nojekyll' --exclude='_expo/.routes.json' "$RUNNER_TEMP/export/" ./
+          git add -A
+          test "$(git diff --cached --name-only | wc -l | tr -d ' ')" = "25"
+          git diff --cached --check
+          test "$(grep -RIl --include='*.html' 'entry-bcce47eeae7e7708630a40586f95c37e.js' . | wc -l | tr -d ' ')" = "24"
+          test -z "$(grep -RIl --include='*.html' 'entry-ca0fc0cd8ea9bd39224a6d6f80e1134c.js' . || true)"
+          test -f .nojekyll
+          test -f _expo/.routes.json
+          test -f russianPokerHintWorker.js
+
+      - name: Commit and publish production export
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Deploy Russian Poker later-phase hint crash fix'
+          git push origin HEAD:main
