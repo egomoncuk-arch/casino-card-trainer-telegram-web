@@ -969,20 +969,26 @@ exports.canonicalRussianPokerManualPair = canonicalRussianPokerManualPair;
 exports.getRussianPokerInitialHint = getRussianPokerInitialHint;
 exports.getRussianPokerManualPhysicalScenario = getRussianPokerManualPhysicalScenario;
 exports.getRussianPokerManualComparisonBatch = getRussianPokerManualComparisonBatch;
+exports.getRussianPokerAutomaticPairComparison = getRussianPokerAutomaticPairComparison;
 exports.clearRussianPokerHintCache = clearRussianPokerHintCache;
 const cardService_1 = require("./cardService");
 const handEvaluator_1 = require("./handEvaluator");
 const russianPoker_1 = require("./russianPoker");
-exports.RUSSIAN_POKER_HINT_RULES_VERSION = 'russian-poker-sochi-v2';
+exports.RUSSIAN_POKER_HINT_RULES_VERSION = 'russian-poker-sochi-v3-auto-paired';
 /** Multi-card candidates use 256 screening deals and at most 768 high-precision replicas. */
 const MIN_SAMPLES = 256;
 const MAX_SAMPLES = 768;
-const CONFIDENCE_Z = 2.58;
+// Bonferroni-safe two-sided screen for at most 34 legal initial actions at a
+// one-percent family error budget (rounded up from the normal quantile).
+const CONFIDENCE_Z = 3.62;
 const COARSE_CONTINUATION_SAMPLES = 4;
 const PRECISE_CONTINUATION_SAMPLES = 24;
 const EXACT_OUTER_CONTINUATION_SAMPLES = 96;
 const COARSE_PURCHASE_SAMPLES = 4;
 const PRECISE_PURCHASE_SAMPLES = 8;
+const AUTOMATIC_PAIRED_BATCH_SIZE = 1536;
+const AUTOMATIC_PAIRED_BATCHES = 5;
+const AUTOMATIC_PAIRED_Z = 2.5758293035489004;
 const resultCache = new Map();
 function getRussianPokerContinuationSampleBudgets(precision, heldOutOverride) {
     return { policyDecisionSamples: precision === 'precise' ? PRECISE_CONTINUATION_SAMPLES : COARSE_CONTINUATION_SAMPLES,
@@ -1423,10 +1429,42 @@ function getRussianPokerInitialHint(state) {
     const evaluated = candidates.map((candidate, index) => ({ ...candidate, ev: evAt(index), standardError: seAt(index),
         precision: candidate.action === 'fold' || candidate.action === 'play' ? 'exact'
             : statsByIndex.get(index).exactOuter && statsByIndex.get(index).precision === 'precise' ? 'exact_outer_precise_inner' : statsByIndex.get(index).precision }));
-    const winner = [...evaluated].sort((a, b) => b.ev - a.ev || tieOrder(a).localeCompare(tieOrder(b)))[0];
-    const result = normalized({ phase: 'initial', recommendedAction: winner.action, recommendedExchangeCardIds: winner.exchangeCardIds, candidates: evaluated,
-        method: 'deterministic_monte_carlo', sampleCount: MAX_SAMPLES, reason: { key: separated ? 'statistically_separated_with_inner_uncertainty' : 'max_samples_reached',
-            minimumSamples: MIN_SAMPLES, maximumSamples: MAX_SAMPLES, preciseContinuationSamples: PRECISE_CONTINUATION_SAMPLES } });
+    let finalCandidates = evaluated;
+    let paired = null;
+    if (!separated) {
+        const finalists = [...evaluated]
+            .sort((a, b) => b.ev - a.ev || tieOrder(a).localeCompare(tieOrder(b)))
+            .slice(0, 2);
+        const finalistKeys = finalists.map(russianPokerManualCandidateKey);
+        if (new Set(finalistKeys).size === 2) {
+            paired = getRussianPokerAutomaticPairComparison(state, finalistKeys);
+            const pairedValues = new Map([
+                [paired.leftKey, { ev: paired.leftEv, standardError: paired.leftStandardError }],
+                [paired.rightKey, { ev: paired.rightEv, standardError: paired.rightStandardError }],
+            ]);
+            finalCandidates = evaluated.map((candidate) => {
+                const refined = pairedValues.get(russianPokerManualCandidateKey(candidate));
+                return refined ? { ...candidate, ...refined, precision: 'precise' } : candidate;
+            });
+        }
+    }
+    const winner = [...finalCandidates].sort((a, b) => b.ev - a.ev || tieOrder(a).localeCompare(tieOrder(b)))[0];
+    const pairedWinnerKey = paired && (paired.difference > 0 ? paired.leftKey : paired.difference < 0 ? paired.rightKey : null);
+    const pairedWinner = pairedWinnerKey ? finalCandidates.find(candidate => russianPokerManualCandidateKey(candidate) === pairedWinnerKey) : null;
+    const pairedKeys = new Set(paired ? [paired.leftKey, paired.rightKey] : []);
+    const pairedWinnerLower = pairedWinner ? pairedWinner.ev - CONFIDENCE_Z * (pairedWinner.standardError ?? 0) : Number.NEGATIVE_INFINITY;
+    const outsidersBelow = pairedWinner ? finalCandidates.every(candidate => {
+        const candidateKey = russianPokerManualCandidateKey(candidate);
+        return pairedKeys.has(candidateKey)
+            || candidate.ev + CONFIDENCE_Z * (candidate.standardError ?? 0) < pairedWinnerLower;
+    }) : false;
+    const decisionEstablished = separated || Boolean(paired?.separated && pairedWinner === winner && outsidersBelow);
+    const result = normalized({ phase: 'initial', recommendedAction: winner.action, recommendedExchangeCardIds: winner.exchangeCardIds, candidates: finalCandidates,
+        method: 'deterministic_monte_carlo', sampleCount: paired?.sampleCount ?? MAX_SAMPLES,
+        reason: { key: decisionEstablished ? 'statistically_separated_with_inner_uncertainty' : 'max_samples_reached',
+            minimumSamples: MIN_SAMPLES, maximumSamples: paired?.sampleCount ?? MAX_SAMPLES, preciseContinuationSamples: PRECISE_CONTINUATION_SAMPLES,
+            refinement: paired ? 'automatic_paired_finalists' : 'marginal_screen', pairedDifference: paired?.difference ?? 0,
+            pairedMarginOfError: paired?.marginOfError ?? 0 } });
     resultCache.set(key, result);
     return result;
 }
@@ -1506,6 +1544,8 @@ function getRussianPokerManualComparisonBatch(state, dealKey, selectedKeys, batc
     };
     let leftSum = 0;
     let rightSum = 0;
+    let leftSquares = 0;
+    let rightSquares = 0;
     let differenceSum = 0;
     let differenceSquares = 0;
     for (let offset = 0; offset < sampleCount; offset += 1) {
@@ -1519,10 +1559,46 @@ function getRussianPokerManualComparisonBatch(state, dealKey, selectedKeys, batc
         const difference = left - right;
         leftSum += left;
         rightSum += right;
+        leftSquares += left * left;
+        rightSquares += right * right;
         differenceSum += difference;
         differenceSquares += difference * difference;
     }
-    return { dealKey, pairKey, batchIndex, sampleCount, leftKey, rightKey, leftSum, rightSum, differenceSum, differenceSquares };
+    return { dealKey, pairKey, batchIndex, sampleCount, leftKey, rightKey, leftSum, rightSum, leftSquares, rightSquares,
+        differenceSum, differenceSquares };
+}
+function getRussianPokerAutomaticPairComparison(state, selectedKeys) {
+    const [leftKey, rightKey] = canonicalRussianPokerManualPair(selectedKeys);
+    const dealKey = `automatic-paired-v1|${samplingKey('initial', state)}|${leftKey}|${rightKey}`;
+    let sampleCount = 0;
+    let leftSum = 0;
+    let rightSum = 0;
+    let leftSquares = 0;
+    let rightSquares = 0;
+    let differenceSum = 0;
+    let differenceSquares = 0;
+    for (let batchIndex = 0; batchIndex < AUTOMATIC_PAIRED_BATCHES; batchIndex += 1) {
+        const batch = getRussianPokerManualComparisonBatch(state, dealKey, [leftKey, rightKey], batchIndex, AUTOMATIC_PAIRED_BATCH_SIZE, batchIndex * AUTOMATIC_PAIRED_BATCH_SIZE);
+        if (batch.leftSquares === undefined || batch.rightSquares === undefined)
+            throw new Error('Automatic paired batch omitted candidate variance');
+        sampleCount += batch.sampleCount;
+        leftSum += batch.leftSum;
+        rightSum += batch.rightSum;
+        leftSquares += batch.leftSquares;
+        rightSquares += batch.rightSquares;
+        differenceSum += batch.differenceSum;
+        differenceSquares += batch.differenceSquares;
+    }
+    const standardError = (sum, squares) => {
+        const variance = sampleCount > 1 ? Math.max(0, (squares - sum ** 2 / sampleCount) / (sampleCount - 1)) : 0;
+        return Math.sqrt(variance / sampleCount);
+    };
+    const difference = differenceSum / sampleCount;
+    const differenceStandardError = standardError(differenceSum, differenceSquares);
+    const marginOfError = AUTOMATIC_PAIRED_Z * differenceStandardError;
+    return Object.freeze({ leftKey, rightKey, sampleCount, leftEv: leftSum / sampleCount, rightEv: rightSum / sampleCount,
+        leftStandardError: standardError(leftSum, leftSquares), rightStandardError: standardError(rightSum, rightSquares),
+        difference, differenceStandardError, marginOfError, separated: Math.abs(difference) > marginOfError });
 }
 function clearRussianPokerHintCache() { resultCache.clear(); }
 
