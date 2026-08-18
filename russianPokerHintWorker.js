@@ -989,6 +989,9 @@ const PRECISE_PURCHASE_SAMPLES = 8;
 const AUTOMATIC_PAIRED_BATCH_SIZE = 1536;
 const AUTOMATIC_PAIRED_BATCHES = 5;
 const AUTOMATIC_PAIRED_Z = 2.5758293035489004;
+const MANUAL_PAIRED_BATCHES_AFTER_AUTOMATIC = 5;
+const TOTAL_PAIRED_BATCHES = AUTOMATIC_PAIRED_BATCHES + MANUAL_PAIRED_BATCHES_AFTER_AUTOMATIC;
+const FULL_DECK = (0, cardService_1.createDeck)();
 const resultCache = new Map();
 function getRussianPokerContinuationSampleBudgets(precision, heldOutOverride) {
     return { policyDecisionSamples: precision === 'precise' ? PRECISE_CONTINUATION_SAMPLES : COARSE_CONTINUATION_SAMPLES,
@@ -1012,16 +1015,16 @@ function validate(cards) {
 function unknownDeck(known) {
     validate(known);
     const unavailable = new Set(known.map((card) => card.id));
-    return (0, cardService_1.createDeck)().filter((card) => !unavailable.has(card.id));
+    return FULL_DECK.filter((card) => !unavailable.has(card.id));
 }
-function hash(value) {
-    let result = 2166136261;
+function continueHash(result, value) {
     for (let index = 0; index < value.length; index += 1) {
         result ^= value.charCodeAt(index);
         result = Math.imul(result, 16777619);
     }
     return result >>> 0;
 }
+function hash(value) { return continueHash(2166136261, value); }
 function seeded(seed) {
     let state = seed || 0x9e3779b9;
     return () => {
@@ -1057,6 +1060,18 @@ function preparedPlayer(cards) {
 }
 function scenarioNet(player, dealerScore, ante, cost, purchased = false) {
     return (0, russianPoker_1.getRussianPokerNetSettlement)(dealerQualifiesScore(dealerScore), Math.sign(player.score - dealerScore), ante, ante * 2, cost, player.payout, player.secondPayout, purchased) / ante;
+}
+function purchasedDealerCards(dealer, undealt) {
+    let replacedIndex = 0;
+    for (let index = 1; index < dealer.length; index += 1)
+        if (cardService_1.RANK_VALUE[dealer[index].rank] > cardService_1.RANK_VALUE[dealer[replacedIndex].rank])
+            replacedIndex = index;
+    const removed = dealer[replacedIndex];
+    const replaced = [...dealer];
+    replaced[replacedIndex] = undealt[0];
+    if (!dealerQualifiesScore((0, handEvaluator_1.evaluateCardScore)(replaced)) && undealt[0].rank === removed.rank && undealt.length > 1)
+        replaced[replacedIndex] = undealt[1];
+    return replaced;
 }
 function forEachFour(deck, visit) {
     for (let a = 0; a < deck.length - 3; a += 1)
@@ -1208,10 +1223,10 @@ function getRussianPokerDealerGameHint(state) {
 function sampledPurchaseEv(player, dealer, remaining, ante, cost, seedKey, samples) {
     const take = scenarioNet(player, (0, handEvaluator_1.evaluateCardScore)(dealer), ante, cost);
     let total = 0;
+    const purchaseSeed = hash(`${seedKey}|purchase|`);
     for (let sample = 0; sample < samples; sample += 1) {
-        const draw = sampledPrefix(remaining, hash(`${seedKey}|purchase|${sample}`), 2);
-        const replacement = (0, russianPoker_1.buyRussianPokerDealerGame)(dealer, draw);
-        total += scenarioNet(player, (0, handEvaluator_1.evaluateCardScore)(replacement.dealerCards), ante, cost + ante, true);
+        const draw = sampledPrefix(remaining, continueHash(purchaseSeed, String(sample)), 2);
+        total += scenarioNet(player, (0, handEvaluator_1.evaluateCardScore)(purchasedDealerCards(dealer, draw)), ante, cost + ante, true);
     }
     return Math.max(take, total / samples);
 }
@@ -1222,28 +1237,32 @@ function purchaseDecisionAndEvaluation(player, dealer, remaining, ante, cost, ke
         return take;
     // Selection and scoring use disjoint deterministic replacement streams.
     let total = 0;
+    const evaluationSeed = hash(`${key}|evaluation|`);
     for (let sample = 0; sample < samples; sample += 1) {
-        const draw = sampledPrefix(remaining, hash(`${key}|evaluation|${sample}`), 2);
-        const replacement = (0, russianPoker_1.buyRussianPokerDealerGame)(dealer, draw);
-        total += scenarioNet(player, (0, handEvaluator_1.evaluateCardScore)(replacement.dealerCards), ante, cost + ante, true);
+        const draw = sampledPrefix(remaining, continueHash(evaluationSeed, String(sample)), 2);
+        total += scenarioNet(player, (0, handEvaluator_1.evaluateCardScore)(purchasedDealerCards(dealer, draw)), ante, cost + ante, true);
     }
     return total / samples;
 }
-function selectContinuationPolicy(state, key, continuationSamples, purchaseSamples) {
-    const known = [...state.playerCards, state.dealerVisibleCard, ...(state.discardedPlayerCards ?? [])];
-    const deck = unknownDeck(known);
-    const player = preparedPlayer(state.playerCards);
+function prepareContinuation(state, deck, player) {
+    const preparedDeck = deck ?? unknownDeck([...state.playerCards, state.dealerVisibleCard, ...(state.discardedPlayerCards ?? [])]);
+    const prepared = player ?? preparedPlayer(state.playerCards);
     const cost = state.improvementCost ?? 0;
-    const fold = -(state.ante + cost) / state.ante;
     const postBet = state.availableBalance - state.ante * 2;
+    const insuranceMax = postBet >= 0 && (0, russianPoker_1.canInsureRussianPokerHand)(state.playerCards) ? (0, russianPoker_1.getRussianPokerSelectableInsuranceMaximum)((0, russianPoker_1.getRussianPokerInsuranceLimit)(state.playerCards, state.ante * 2, state.playerCards.length === 6).maximumInsurance, postBet, state.ante) : 0;
+    return { deck: preparedDeck, player: prepared, cost, postBet, insuranceMax };
+}
+function selectPreparedContinuationPolicy(state, key, continuationSamples, purchaseSamples, prepared) {
+    const { deck, player, cost, postBet, insuranceMax } = prepared;
+    const fold = -(state.ante + cost) / state.ante;
     if (postBet < 0)
         return { plays: false, insurance: 0, fold };
-    const insuranceMax = (0, russianPoker_1.canInsureRussianPokerHand)(state.playerCards) ? (0, russianPoker_1.getRussianPokerSelectableInsuranceMaximum)((0, russianPoker_1.getRussianPokerInsuranceLimit)(state.playerCards, state.ante * 2, state.playerCards.length === 6).maximumInsurance, postBet, state.ante) : 0;
     const decisionScenarios = [];
     let decisionNoGame = 0;
     let decisionLost = 0;
+    const hiddenSeed = hash(`${key}|hidden|`);
     for (let sample = 0; sample < continuationSamples; sample += 1) {
-        const draw = sampledPrefix(deck, hash(`${key}|hidden|${sample}`), 4);
+        const draw = sampledPrefix(deck, continueHash(hiddenSeed, String(sample)), 4);
         const dealer = [state.dealerVisibleCard, ...draw.slice(0, 4)];
         const score = (0, handEvaluator_1.evaluateCardScore)(dealer);
         decisionScenarios.push({ dealer, remaining: draw.slice(4), score });
@@ -1267,18 +1286,16 @@ function selectContinuationPolicy(state, key, continuationSamples, purchaseSampl
 function visibleContinuation(state, precision, replicaKey, sampleOverride, commonScenarioKey) {
     const budgets = getRussianPokerContinuationSampleBudgets(precision, sampleOverride);
     const key = commonScenarioKey ?? `${samplingKey('final_play_fold', state)}|continuation|${precision}|replica:${replicaKey}`;
-    const known = [...state.playerCards, state.dealerVisibleCard, ...(state.discardedPlayerCards ?? [])];
-    const deck = unknownDeck(known);
-    const player = preparedPlayer(state.playerCards);
-    const cost = state.improvementCost ?? 0;
-    const postBet = state.availableBalance - state.ante * 2;
-    const policy = selectContinuationPolicy(state, key, budgets.policyDecisionSamples, budgets.purchaseDecisionSamples);
+    const prepared = prepareContinuation(state);
+    const { deck, player, cost, postBet } = prepared;
+    const policy = selectPreparedContinuationPolicy(state, key, budgets.policyDecisionSamples, budgets.purchaseDecisionSamples, prepared);
     if (!policy.plays)
         return { ev: policy.fold, varianceOfMean: 0 };
     let total = 0;
     let squares = 0;
+    const evaluationSeed = hash(`${key}|evaluation-hidden|`);
     for (let sample = 0; sample < budgets.heldOutEvaluationSamples; sample += 1) {
-        const draw = sampledPrefix(deck, hash(`${key}|evaluation-hidden|${sample}`), 4);
+        const draw = sampledPrefix(deck, continueHash(evaluationSeed, String(sample)), 4);
         const dealer = [state.dealerVisibleCard, ...draw.slice(0, 4)];
         const score = (0, handEvaluator_1.evaluateCardScore)(dealer);
         let value = scenarioNet(player, score, state.ante, cost);
@@ -1461,6 +1478,7 @@ function getRussianPokerInitialHint(state) {
     const decisionEstablished = separated || Boolean(paired?.separated && pairedWinner === winner && outsidersBelow);
     const result = normalized({ phase: 'initial', recommendedAction: winner.action, recommendedExchangeCardIds: winner.exchangeCardIds, candidates: finalCandidates,
         method: 'deterministic_monte_carlo', sampleCount: paired?.sampleCount ?? MAX_SAMPLES,
+        automaticPairComparison: paired ?? undefined,
         reason: { key: decisionEstablished ? 'statistically_separated_with_inner_uncertainty' : 'max_samples_reached',
             minimumSamples: MIN_SAMPLES, maximumSamples: paired?.sampleCount ?? MAX_SAMPLES, preciseContinuationSamples: PRECISE_CONTINUATION_SAMPLES,
             refinement: paired ? 'automatic_paired_finalists' : 'marginal_screen', pairedDifference: paired?.difference ?? 0,
@@ -1474,15 +1492,18 @@ function getRussianPokerManualPhysicalScenario(state, dealKey, selectedKeys, abs
     const [leftKey, rightKey] = canonicalRussianPokerManualPair(selectedKeys);
     const pairKey = `${leftKey}|${rightKey}`;
     const deck = unknownDeck([...state.playerCards, state.dealerVisibleCard, ...(state.discardedPlayerCards ?? [])]);
-    const permutation = sampledPrefix(deck, hash(`${samplingKey('initial', state)}|manual-deep-v2|deal:${dealKey}|pair:${pairKey}|replica:${absoluteReplica}`), deck.length);
+    const seedPrefix = hash(`${samplingKey('initial', state)}|manual-deep-v2|deal:${dealKey}|pair:${pairKey}|replica:`);
+    const permutation = sampledPrefix(deck, continueHash(seedPrefix, String(absoluteReplica)), deck.length);
     return { absoluteReplica, dealerHiddenCardIds: Object.freeze(permutation.slice(0, 4).map(card => card.id)),
         permutationCardIds: Object.freeze(permutation.map(card => card.id)) };
 }
-function getRussianPokerManualComparisonBatch(state, dealKey, selectedKeys, batchIndex, sampleCount = 1536, absoluteStart = batchIndex * 1536) {
+function getRussianPokerManualComparisonBatch(state, dealKey, selectedKeys, batchIndex, sampleCount = 1536, absoluteStart = batchIndex * 1536, streamDealKey = dealKey) {
     if (!dealKey)
         throw new Error('Manual comparison requires a deal key');
-    if (!Number.isSafeInteger(batchIndex) || batchIndex < 0 || batchIndex >= 5)
-        throw new Error('Manual comparison supports five batches');
+    if (!streamDealKey)
+        throw new Error('Manual comparison requires a stream key');
+    if (!Number.isSafeInteger(batchIndex) || batchIndex < 0 || batchIndex >= TOTAL_PAIRED_BATCHES)
+        throw new Error('Manual comparison batch is outside the supported range');
     if (!Number.isSafeInteger(sampleCount) || sampleCount < 1)
         throw new Error('Invalid manual comparison sample count');
     if (!Number.isSafeInteger(absoluteStart) || absoluteStart < 0)
@@ -1493,50 +1514,46 @@ function getRussianPokerManualComparisonBatch(state, dealKey, selectedKeys, batc
     if (!legal.has(leftKey) || !legal.has(rightKey))
         throw new Error('Illegal manual-comparison candidate');
     const initialDeck = unknownDeck([...state.playerCards, state.dealerVisibleCard, ...(state.discardedPlayerCards ?? [])]);
-    const cardById = new Map(initialDeck.map(card => [card.id, card]));
+    const physicalSeedPrefix = hash(`${samplingKey('initial', state)}|manual-deep-v2|deal:${streamDealKey}|pair:${pairKey}|replica:`);
+    const policyNamespacePrefix = `manual-policy-v2|deal:${streamDealKey}|pair:${pairKey}|replica:`;
     const directPlayInsurance = leftKey === 'play' || rightKey === 'play' ? getRussianPokerInsuranceHint({ ...state,
         availableBalance: state.availableBalance - state.ante * 2, improvementUsed: true }).recommendedInsuranceAmount ?? 0 : null;
-    const evaluate = (key, permutation, replica) => {
-        if (key === 'fold')
-            return -1;
+    const makePlan = (key) => {
         const candidate = manualCandidate(key);
-        let cards = state.playerCards;
-        let cost = 0;
-        let replacementCount = 0;
-        if (candidate.action === 'buy_sixth_card') {
-            replacementCount = 1;
-            cost = state.ante;
-            cards = [...cards, permutation[4]];
-        }
-        else if (candidate.action === 'exchange') {
-            const exchanged = new Set(candidate.exchangeCardIds);
-            replacementCount = exchanged.size;
-            cost = state.ante;
-            cards = [...cards.filter(card => !exchanged.has(card.id)), ...permutation.slice(4, 4 + replacementCount)];
-        }
-        const discarded = [...(state.discardedPlayerCards ?? []), ...state.playerCards.filter(card => candidate.exchangeCardIds?.includes(card.id))];
+        const exchanged = new Set(candidate.exchangeCardIds ?? []);
+        const replacementCount = candidate.action === 'buy_sixth_card' ? 1 : candidate.action === 'exchange' ? exchanged.size : 0;
+        return { key, candidate, replacementCount, cost: replacementCount > 0 ? state.ante : 0,
+            heldCards: candidate.action === 'exchange' ? state.playerCards.filter(card => !exchanged.has(card.id)) : state.playerCards,
+            discarded: [...(state.discardedPlayerCards ?? []), ...state.playerCards.filter(card => exchanged.has(card.id))] };
+    };
+    const leftPlan = makePlan(leftKey);
+    const rightPlan = makePlan(rightKey);
+    const evaluate = (plan, permutation, replica, dealer, dealerScore, dealerHiddenIds) => {
+        if (plan.key === 'fold')
+            return -1;
+        const { candidate, replacementCount, cost, discarded } = plan;
+        const replacementCards = permutation.slice(4, 4 + replacementCount);
+        const cards = replacementCount > 0 ? [...plan.heldCards, ...replacementCards] : plan.heldCards;
+        const replacementIds = new Set(replacementCards.map(card => card.id));
+        const continuationDeck = replacementCount > 0 ? initialDeck.filter(card => !replacementIds.has(card.id)) : initialDeck;
+        const player = preparedPlayer(cards);
         const continuationState = { ...state, playerCards: cards, discardedPlayerCards: discarded,
             availableBalance: state.availableBalance - cost, improvementUsed: true,
             improvementType: candidate.action === 'exchange' ? 'exchange' : candidate.action === 'buy_sixth_card' ? 'sixth_card' : undefined, improvementCost: cost };
-        const policyKey = `${samplingKey('final_play_fold', continuationState)}|${getRussianPokerManualPolicyNamespace(dealKey, [leftKey, rightKey], replica)}`;
-        const sampledPolicy = key === 'play' ? null : selectContinuationPolicy(continuationState, policyKey, PRECISE_CONTINUATION_SAMPLES, PRECISE_PURCHASE_SAMPLES);
+        const policyKey = `${samplingKey('final_play_fold', continuationState)}|${policyNamespacePrefix}${replica}`;
+        const prepared = prepareContinuation(continuationState, continuationDeck, player);
+        const sampledPolicy = plan.key === 'play' ? null : selectPreparedContinuationPolicy(continuationState, policyKey, PRECISE_CONTINUATION_SAMPLES, PRECISE_PURCHASE_SAMPLES, prepared);
         const policy = sampledPolicy ?? { plays: true, insurance: directPlayInsurance ?? 0, fold: -1 };
         if (!policy.plays)
             return policy.fold;
-        const dealer = [state.dealerVisibleCard, ...permutation.slice(0, 4)];
-        const dealerScore = (0, handEvaluator_1.evaluateCardScore)(dealer);
-        const player = preparedPlayer(cards);
         let value = scenarioNet(player, dealerScore, state.ante, cost);
-        const postBet = continuationState.availableBalance - state.ante * 2;
-        if (!dealerQualifiesScore(dealerScore) && (0, russianPoker_1.russianPokerDealerQualifies)(player.hand) && postBet + policy.insurance >= state.ante) {
-            const unavailable = new Set([...cards, ...dealer, ...discarded].map(card => card.id));
-            const decisionDeck = (0, cardService_1.createDeck)().filter(card => !unavailable.has(card.id));
+        if (!dealerQualifiesScore(dealerScore) && (0, russianPoker_1.russianPokerDealerQualifies)(player.hand) && prepared.postBet + policy.insurance >= state.ante) {
+            const decisionDeck = continuationDeck.filter(card => !dealerHiddenIds.has(card.id));
             const take = value;
             const buys = sampledPurchaseEv(player, dealer, decisionDeck, state.ante, cost, `${policyKey}|revealed:${dealer.slice(1).map(card => card.id).sort().join(',')}`, PRECISE_PURCHASE_SAMPLES) > take;
             if (buys) {
-                const physicalRemaining = permutation.slice(4 + replacementCount).filter(card => !unavailable.has(card.id));
-                const replacement = (0, russianPoker_1.buyRussianPokerDealerGame)(dealer, physicalRemaining.slice(0, 2));
-                value = scenarioNet(player, (0, handEvaluator_1.evaluateCardScore)(replacement.dealerCards), state.ante, cost + state.ante, true);
+                const physicalRemaining = permutation.slice(4 + replacementCount);
+                value = scenarioNet(player, (0, handEvaluator_1.evaluateCardScore)(purchasedDealerCards(dealer, physicalRemaining)), state.ante, cost + state.ante, true);
             }
         }
         value += policy.insurance > 0 ? (!dealerQualifiesScore(dealerScore) ? policy.insurance / state.ante : player.score > dealerScore ? -policy.insurance / state.ante : 0) : 0;
@@ -1549,13 +1566,13 @@ function getRussianPokerManualComparisonBatch(state, dealKey, selectedKeys, batc
     let differenceSum = 0;
     let differenceSquares = 0;
     for (let offset = 0; offset < sampleCount; offset += 1) {
-        // The preliminary 768-replica stream has no `manual-deep-v2` namespace. Each
-        // canonical pair gets five disjoint absolute ranges in this independent stream.
         const absoluteReplica = absoluteStart + offset;
-        const physical = getRussianPokerManualPhysicalScenario(state, dealKey, [leftKey, rightKey], absoluteReplica);
-        const permutation = physical.permutationCardIds.map(id => cardById.get(id));
-        const left = evaluate(leftKey, permutation, absoluteReplica);
-        const right = evaluate(rightKey, permutation, absoluteReplica);
+        const permutation = sampledPrefix(initialDeck, continueHash(physicalSeedPrefix, String(absoluteReplica)), initialDeck.length);
+        const dealerHiddenIds = new Set(permutation.slice(0, 4).map(card => card.id));
+        const dealer = [state.dealerVisibleCard, ...permutation.slice(0, 4)];
+        const dealerScore = (0, handEvaluator_1.evaluateCardScore)(dealer);
+        const left = evaluate(leftPlan, permutation, absoluteReplica, dealer, dealerScore, dealerHiddenIds);
+        const right = evaluate(rightPlan, permutation, absoluteReplica, dealer, dealerScore, dealerHiddenIds);
         const difference = left - right;
         leftSum += left;
         rightSum += right;
@@ -1596,7 +1613,9 @@ function getRussianPokerAutomaticPairComparison(state, selectedKeys) {
     const difference = differenceSum / sampleCount;
     const differenceStandardError = standardError(differenceSum, differenceSquares);
     const marginOfError = AUTOMATIC_PAIRED_Z * differenceStandardError;
-    return Object.freeze({ leftKey, rightKey, sampleCount, leftEv: leftSum / sampleCount, rightEv: rightSum / sampleCount,
+    return Object.freeze({ dealKey, pairKey: `${leftKey}|${rightKey}`, batchCount: AUTOMATIC_PAIRED_BATCHES,
+        leftKey, rightKey, sampleCount, leftSum, rightSum, leftSquares, rightSquares, differenceSum, differenceSquares,
+        leftEv: leftSum / sampleCount, rightEv: rightSum / sampleCount,
         leftStandardError: standardError(leftSum, leftSquares), rightStandardError: standardError(rightSum, rightSquares),
         difference, differenceStandardError, marginOfError, separated: Math.abs(difference) > marginOfError });
 }
@@ -1605,4 +1624,4 @@ function clearRussianPokerHintCache() { resultCache.clear(); }
 }},cache={};
 function require(id){const key=id.replace(/\.js$/,'');if(cache[key])return cache[key].exports;const factory=modules[key];if(!factory)throw new Error('Unknown worker module '+key);const module={exports:{}};cache[key]=module;factory(require,module,module.exports);return module.exports;}
 const engine=require('./russianPokerHint');
-self.onmessage=({data})=>{const {id,request}=data;try{let result;switch(request.phase){case 'initial':result=engine.getRussianPokerInitialHint(request.state);break;case 'final_play_fold':result=engine.getRussianPokerFinalHint(request.state);break;case 'insurance':result=engine.getRussianPokerInsuranceHint(request.state);break;case 'dealer_game':result=engine.getRussianPokerDealerGameHint(request.state);break;case 'manual_comparison':result=engine.getRussianPokerManualComparisonBatch(request.state,request.dealKey,request.candidateKeys,request.batchIndex,request.sampleCount);break;default:throw new Error('Unsupported phase');}self.postMessage({id,result});}catch(error){self.postMessage({id,error:error instanceof Error?error.message:String(error)});}};
+self.onmessage=({data})=>{const {id,request}=data;try{let result;switch(request.phase){case 'initial':result=engine.getRussianPokerInitialHint(request.state);break;case 'final_play_fold':result=engine.getRussianPokerFinalHint(request.state);break;case 'insurance':result=engine.getRussianPokerInsuranceHint(request.state);break;case 'dealer_game':result=engine.getRussianPokerDealerGameHint(request.state);break;case 'manual_comparison':result=engine.getRussianPokerManualComparisonBatch(request.state,request.dealKey,request.candidateKeys,request.batchIndex,request.sampleCount,undefined,request.streamDealKey);break;default:throw new Error('Unsupported phase');}self.postMessage({id,result});}catch(error){self.postMessage({id,error:error instanceof Error?error.message:String(error)});}};
