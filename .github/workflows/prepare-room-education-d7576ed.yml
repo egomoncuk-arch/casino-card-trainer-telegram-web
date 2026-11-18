@@ -1,0 +1,80 @@
+name: Validate and prepare release of guided room educational examples
+on:
+  push:
+    branches:
+      - release/room-scenarios-d7576ed-20261118
+permissions:
+  contents: write
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Confirm release base
+        run: |
+          test "$(git rev-parse HEAD^)" = "b27327b640615cbb5569b1e4236b678727f4bdc3"
+          test "$(git log -1 --format=%s)" = "Prepare reviewed room Web release d7576ed"
+      - name: Download pinned production artifact
+        env:
+          ARTIFACT_URL: 'https://sdmntprnortheu.oaiusercontent.com/files/00000000-7fb0-81f4-bf04-9be7cd436944/raw?se=2026-11-18T20%3A57%3A26Z&sp=r&sv=2026-06-06&sr=b&scid=aeffc891-bcb4-541e-a809-4a30186aa9ab&skoid=c30e7ce7-1f51-4051-a377-288cdba21c02&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-11-18T20%3A44%3A05Z&ske=2026-11-19T20%3A44%3A05Z&sks=b&skv=2026-06-06&sig=9ocD7wqZ%2BlF9UwHP/I32EbekBJvNxP%2BVWog1uESd1tg%3D'
+        run: |
+          curl -fLsS --retry 2 --connect-timeout 15 --max-time 120 "$ARTIFACT_URL" -o "$RUNNER_TEMP/web.zip"
+          echo 'a33a3759c39ab39e004549a28b1241a7e6d8232b81075ef1800578f4e7e0cd4b  '"$RUNNER_TEMP/web.zip" | sha256sum -c -
+      - name: Verify exported source and unzip
+        run: |
+          python3 - <<'PY'
+          import os, zipfile
+          from pathlib import PurePosixPath
+          with zipfile.ZipFile(os.environ["RUNNER_TEMP"]+"/web.zip") as z:
+              names=[x.filename for x in z.infolist() if not x.is_dir()]
+              assert len(names)==69
+              assert all(not n.startswith("/") and ".." not in PurePosixPath(n).parts for n in names)
+              html=[n for n in names if n.endswith(".html")]
+              assert len(html)==26
+              js=[n for n in names if n.startswith("_expo/static/js/web/entry-") and n.endswith(".js")]
+              assert len(js)==1
+              bundle=js[0].split("/")[-1]
+              assert all(bundle in z.read(path).decode() for path in html)
+              compiled=z.read(js[0])
+              assert b"roomInvite" in compiled and b"egomoncuk92.workers.dev" in compiled
+              assert b"cct-study-rooms-staging" not in compiled and b"localhost:8788" not in compiled
+              z.extractall(os.environ["RUNNER_TEMP"]+"/web-export")
+              open(os.environ["RUNNER_TEMP"]+"/bundle-name","w").write(bundle)
+          print("Valid production export: 26 HTML pages, one linked JS bundle")
+          PY
+      - name: Synchronize static website WITH CHECKSUM and preserve cached scripts
+        run: |
+          rsync -a --checksum --delete --exclude '.git' --exclude '.github' --exclude '.nojekyll' --exclude '/_expo/static/js/web/entry-*.js' "$RUNNER_TEMP/web-export/" ./
+          mkdir -p _expo/static/js/web
+          cp "$RUNNER_TEMP"/web-export/_expo/static/js/web/entry-*.js _expo/static/js/web/
+          touch .nojekyll
+      - name: Verify bytes of every HTML page
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, hashlib, re
+          src=pathlib.Path(os.environ["RUNNER_TEMP"]+"/web-export")
+          bundle=pathlib.Path(os.environ["RUNNER_TEMP"]+"/bundle-name").read_text()
+          html=list(src.rglob("*.html"))
+          assert len(html)==26
+          for path in html:
+              new=pathlib.Path(path.relative_to(src))
+              assert new.is_file()
+              assert hashlib.sha256(path.read_bytes()).digest()==hashlib.sha256(new.read_bytes()).digest(), str(new)
+              refs=re.findall(r"entry-[0-9a-f]+[.]js",new.read_text())
+              assert refs and set(refs)=={bundle}, str(new)
+          assert pathlib.Path("_expo/static/js/web",bundle).is_file()
+          assert len(list(pathlib.Path("_expo/static/js/web").glob("entry-*.js")))>=2
+          print("PASS: all 26 HTML files exactly match the export; old Telegram JS preserved")
+          PY
+      - name: Commit candidate branch without temporary workflow
+        run: |
+          rm -f '.github/workflows/prepare-room-education-d7576ed.yml'
+          git add -A
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'release(web): guided room educational examples d7576ed'
+          git push origin HEAD:release/room-scenarios-d7576ed-20261118
