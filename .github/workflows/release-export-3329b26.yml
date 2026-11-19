@@ -1,0 +1,68 @@
+name: Publish verified guarded Expo Web to release branch
+on:
+  push:
+    branches:
+      - release/guided-web-3329b26-20261119
+permissions:
+  contents: write
+jobs:
+  stage-production-export:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Retrieve immutable GitHub Actions production artifact
+        env:
+          VERIFIED_SOURCE_ARTIFACT: 'https://sdmntprdenmarkeast.oaiusercontent.com/files/00000000-80ec-8210-ab9f-4c1121042a05/raw?se=2026-11-19T03%3A39%3A02Z&sp=r&sv=2026-06-06&sr=b&scid=8d26032a-7476-5371-b7ac-aff65b117cc5&skoid=c30e7ce7-1f51-4051-a377-288cdba21c02&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-11-18T19%3A44%3A26Z&ske=2026-11-19T19%3A44%3A26Z&sks=b&skv=2026-06-06&sig=PHLi7Eplx%2BCJaaA1XL9bMnO6klxsfhKEALPW5btatYs%3D'
+        run: |
+          curl -fLsS --retry 2 --connect-timeout 20 --max-time 180 "$VERIFIED_SOURCE_ARTIFACT" -o "$RUNNER_TEMP/cct-production.zip"
+          echo '3a5530281760a06ae50b1585dc820016f3356e3909ccb0445f0f639f6742a761  '"$RUNNER_TEMP/cct-production.zip" | sha256sum -c -
+      - name: Verify exact Expo export and preserve previous Telegram bundles
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path, PurePosixPath
+          import os, zipfile, re, stat, hashlib
+          root=Path.cwd()
+          zip_path=Path(os.environ['RUNNER_TEMP'])/'cct-production.zip'
+          expected='entry-e15507b0c5ca122c078e49a5573e0ed2.js'
+          previous={x.name for x in (root/'_expo/static/js/web').glob('entry-*.js')}
+          assert len(previous)>=2 and 'entry-9fbb58ce6042774496fc4ef284a80710.js' in previous, 'Previous working JS must remain available'
+          with zipfile.ZipFile(zip_path) as archive:
+            entries=[i for i in archive.infolist() if not i.is_dir()]
+            names=[i.filename for i in entries]
+            assert len(names)==69 and len(set(names))==69, 'Expected exactly 69 unique compiled production files'
+            assert sum(i.file_size for i in entries)<15_000_000, 'Unexpected artifact size'
+            assert all(not PurePosixPath(n).is_absolute() and '..' not in PurePosixPath(n).parts and not n.startswith('.git') for n in names), 'Unsafe ZIP path'
+            assert all(stat.S_IFMT(i.external_attr>>16)!=stat.S_IFLNK for i in entries), 'No symlink ZIP entries'
+            html=[n for n in names if n.endswith('.html')]
+            bundles=[n for n in names if re.fullmatch(r'_expo/static/js/web/entry-[0-9a-f]+\.js',n)]
+            assert len(html)==26 and len(bundles)==1 and bundles[0].endswith(expected), 'Wrong page or script count'
+            for n in html:
+              data=archive.read(n).decode('utf-8')
+              assert re.findall(r'entry-[0-9a-f]+\.js',data)==[expected], 'HTML references missing or stale compiled JS: '+n
+            js=archive.read(bundles[0])
+            assert b'casino-card-trainer-telegram-backend.egomoncuk92.workers.dev' in js, 'Production Worker API missing'
+            assert b'require_hand_ready' in js and b'set_hand_ready' in js, 'Missing checked-in app improvements'
+            assert b'cct-study-rooms-staging' not in js and b'localhost:8788' not in js and b'cct-preview.invalid' not in js, 'Staging/preview URL forbidden'
+            for info in entries:
+              target=root/info.filename
+              target.parent.mkdir(parents=True,exist_ok=True)
+              target.write_bytes(archive.read(info))
+          assert all((root/'_expo/static/js/web'/old).is_file() for old in previous), 'Cached Telegram JS removed'
+          assert (root/'index.html').is_file() and (root/'.nojekyll').is_file(), 'GitHub Pages root missing'
+          print('PASS: 26 HTML routes reference verified new JS; previous bundles retained; original assets; production-guided API.')
+          PY
+      - name: Stage only original export and remove temporary workflow
+        run: |
+          rm -f .github/workflows/release-export-3329b26.yml
+          git add -A
+          git diff --cached --check
+          test -n "$(git diff --cached --name-only)"
+          git diff --cached --name-only
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "release(web): verified Expo 3329b26, retain old Telegram bundles and guided-only gameplay"
+          git push origin HEAD:refs/heads/release/guided-web-3329b26-20261119
